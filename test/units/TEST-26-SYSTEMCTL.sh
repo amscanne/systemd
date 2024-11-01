@@ -16,6 +16,13 @@ at_exit() {
     return 0
 }
 
+# Ensure that the various environment variables work as expected,
+# when working with the legacy $DBUS_SESSION_BUS_ADDRESS. This is
+# a simple regress test for #34851.
+(export DBUS_SESSION_BUS_ADDRESS=$XDG_RUNTIME_DIR; unset XDG_RUNTIME_DIR; systemctl --user is-system-running)
+(export DBUS_SESSION_BUS_ADDRESS=$XDF_RUNTIME_DIR; systemctl --user is-system-running)
+(export DBUS_SESSION_BUS_ADDRESS=should-be-ignored; systemctl --user is-system-running)
+
 # Create a simple unit file for testing
 # Note: the service file is created under /usr on purpose to test
 #       the 'revert' verb as well
