@@ -4,6 +4,7 @@
 #include "conf-parser-forward.h"
 #include "forward.h"
 #include "oomd-util.h"
+#include "oomd-kill.h"
 
 /* Polling interval for monitoring stats */
 #define SWAP_INTERVAL_USEC 150000 /* 0.15 seconds */

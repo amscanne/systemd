@@ -241,14 +241,22 @@ static int prekill_callback(
                 const char *error_id,
                 sd_varlink_reply_flags_t flags,
                 void *userdata) {
+        _cleanup_(sd_oomd_kill_state_unrefp) sd_oomd_kill_state *kill = (sd_oomd_kill_state*)userdata;
 
         if (error_id)
                 log_warning("oomd prekill hook returned error: %s", error_id);
 
+        // Dropping the link should close, and it will cause it to decref on
+        // the underlying event source.
+        sd_varlink_unref(link);
+
+        // This may perform the kill.
+        sd_oomd_kill_dec_pending(kill);
+
         return 0;
 }
 
-static int oomd_prekill_hook(const char *path, usec_t deadline, sd_event *e) {
+static int oomd_prekill_hook(const char *path, usec_t deadline, sd_event *e, sd_oomd_kill_state **kill_out) {
         _cleanup_closedir_ DIR *d = NULL;
 
         int r;
@@ -266,58 +274,80 @@ static int oomd_prekill_hook(const char *path, usec_t deadline, sd_event *e) {
                         return -ESRCH;
 
                 return log_warning_errno(errno, "Failed to open prekill varlink socket directory %s, ignoring: %m",
-                                         VARLINK_ADDR_PATH_PREKILL);
+                        VARLINK_ADDR_PATH_PREKILL);
         }
 
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *cparams = NULL;
-        r = sd_json_buildo(&cparams, SD_JSON_BUILD_PAIR("cgroup", SD_JSON_BUILD_STRING(path)));
-        if (r < 0)
-                return log_oom_debug();
+  _cleanup_(sd_json_variant_unrefp) sd_json_variant *cparams = NULL;
+  r = sd_json_buildo(&cparams, SD_JSON_BUILD_PAIR("cgroup", SD_JSON_BUILD_STRING(path)));
+  if (r < 0)
+    return log_oom_debug();
 
-        /* TODO: call hooks in parallel */
-        FOREACH_DIRENT(de, d, return -errno) {
-                _cleanup_(sd_varlink_close_unrefp) sd_varlink *link = NULL;
-                _cleanup_free_ char *hook_path = NULL;
+  // Create our kill state.
+  _cleanup_(sd_oomd_kill_state_unrefp) sd_oomd_kill_state *kill = NULL;
+  r = sd_oomd_kill_state_new(&kill);
+  if (r < 0)
+    return log_oom_debug();
+  sd_oomd_kill_state_inc_pending(kill);
 
-                hook_path = path_join(VARLINK_ADDR_PATH_PREKILL, de->d_name);
-                if (!hook_path)
-                        return log_oom_debug();
+  /* TODO: call hooks in parallel */
+  FOREACH_DIRENT(de, d, return -errno) {
+    _cleanup_(sd_varlink_close_unrefp) sd_varlink *link = NULL;
+    _cleanup_free_ char *hook_path = NULL;
 
-                r = sd_varlink_connect_address(&link, hook_path);
-                if (r < 0) {
-                        log_debug("Prekill socket at %s not connected, ignoring.", hook_path);
-                        continue;
-                }
+    hook_path = path_join(VARLINK_ADDR_PATH_PREKILL, de->d_name);
+    if (!hook_path)
+      return log_oom_debug();
 
-                (void) sd_varlink_set_description(link, "oomd prekill hook");
-                (void) sd_varlink_set_relative_timeout(link, deadline);
+    r = sd_varlink_connect_address(&link, hook_path);
+    if (r < 0) {
+      log_debug("Prekill socket at %s not connected, ignoring.", hook_path);
+      continue;
+    }
 
-                r = sd_varlink_bind_reply(link, prekill_callback);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to bind reply callback: %m");
+    (void) sd_varlink_set_description(link, "oomd prekill hook");
+    (void) sd_varlink_set_relative_timeout(link, deadline);
+    (void) sd_varlink_set_userdata(link, kill);
 
-                r = sd_varlink_attach_event(link, e, SD_EVENT_PRIORITY_NORMAL);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to attach varlink to event loop: %m");
+    r = sd_varlink_bind_reply(link, prekill_callback);
+    if (r < 0) {
+      log_debug_errno(r, "Failed to bind reply callback: %m");
+      continue;
+    }
 
-                r = sd_varlink_invoke(link, "org.freedesktop.oom1.Prekill", cparams);
-                if (r < 0)
-                        log_warning_errno(r, "Failed to call varlink method org.freedesktop.oom1.Prekill: %m");
-        }
+    r = sd_varlink_attach_event(link, e, SD_EVENT_PRIORITY_NORMAL);
+    if (r < 0) {
+      log_debug_errno(r, "Failed to attach varlink to event loop: %m");
+      continue;
+    }
 
-        return 0;
+    r = sd_varlink_invoke(link, "org.freedesktop.oom1.Prekill", cparams);
+    if (r < 0) {
+      log_warning_errno(r, "Failed to call varlink method org.freedesktop.oom1.Prekill: %m");
+      continue;
+    }
+    sd_oomd_kill_state_inc_pending(kill);
+    sd_oomd_kill_state_ref(kill);
+  }
+
+  sd_oomd_kill_state_dec_pending(kill);
+  assert(kill_out == NULL);
+  *kill_out = sd_oomd_kill_state_ref(kill);
+  return 0;
 }
 
 int oomd_cgroup_kill(const char *path, bool recurse, bool dry_run, usec_t prekill_deadline, sd_event *e) {
         _cleanup_set_free_ Set *pids_killed = NULL;
+        _cleanup_(sd_oomd_kill_state_unrefp) sd_oomd_kill_state *kill = NULL;
         int r;
 
         assert(path);
 
-        r = oomd_prekill_hook(path, prekill_deadline, e);
+        r = oomd_prekill_hook(path, prekill_deadline, e, &kill);
         if (r < 0)
                 log_warning_errno(r, "oomd prekill hook failed for %s, ignoring: %m", path);
 
+        // THIS BECOMES THE `KILLER` THAT YOU USE
+#if 0
         if (dry_run) {
                 _cleanup_free_ char *cg_path = NULL;
 
@@ -359,6 +389,7 @@ int oomd_cgroup_kill(const char *path, bool recurse, bool dry_run, usec_t prekil
                 log_debug_errno(r, "Failed to set user.oomd_kill on kill: %m");
 
         return !set_isempty(pids_killed);
+#endif
 }
 
 typedef void (*dump_candidate_func)(const OomdCGroupContext *ctx, FILE *f, const char *prefix);
