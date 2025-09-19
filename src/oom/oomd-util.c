@@ -248,12 +248,17 @@ static int prekill_callback(
         return 0;
 }
 
-static int oomd_prekill_hook(const char *path, usec_t deadline) {
+static int oomd_prekill_hook(const char *path, usec_t deadline, sd_event *e) {
         _cleanup_closedir_ DIR *d = NULL;
 
         int r;
 
         assert(path);
+
+        if (!e) {
+                log_debug("No event loop, skipping oomd prekill hook.");
+                return 0;
+        }
 
         d = opendir(VARLINK_ADDR_PATH_PREKILL);
         if (!d) {
@@ -291,6 +296,10 @@ static int oomd_prekill_hook(const char *path, usec_t deadline) {
                 if (r < 0)
                         return log_debug_errno(r, "Failed to bind reply callback: %m");
 
+                r = sd_varlink_attach_event(link, e, SD_EVENT_PRIORITY_NORMAL);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to attach varlink to event loop: %m");
+
                 r = sd_varlink_invoke(link, "org.freedesktop.oom1.Prekill", cparams);
                 if (r < 0)
                         log_warning_errno(r, "Failed to call varlink method org.freedesktop.oom1.Prekill: %m");
@@ -299,11 +308,13 @@ static int oomd_prekill_hook(const char *path, usec_t deadline) {
         return 0;
 }
 
-int oomd_cgroup_kill(const char *path, bool recurse, bool dry_run, usec_t prekill_deadline) {
+int oomd_cgroup_kill(const char *path, bool recurse, bool dry_run, usec_t prekill_deadline, sd_event *e) {
         _cleanup_set_free_ Set *pids_killed = NULL;
         int r;
 
-        r = oomd_prekill_hook(path, prekill_deadline);
+        assert(path);
+
+        r = oomd_prekill_hook(path, prekill_deadline, e);
         if (r < 0)
                 log_warning_errno(r, "oomd prekill hook failed for %s, ignoring: %m", path);
 
@@ -387,7 +398,7 @@ static int dump_kill_candidates(
         return memstream_dump(LOG_INFO, &m);
 }
 
-int oomd_kill_by_pgscan_rate(Hashmap *h, const char *prefix, bool dry_run, char **ret_selected, usec_t prekill_deadline) {
+int oomd_kill_by_pgscan_rate(Hashmap *h, const char *prefix, bool dry_run, char **ret_selected, usec_t prekill_deadline, sd_event *e) {
         _cleanup_free_ OomdCGroupContext **sorted = NULL;
         const OomdCGroupContext *killed = NULL;
         int n, r, ret = 0;
@@ -407,7 +418,7 @@ int oomd_kill_by_pgscan_rate(Hashmap *h, const char *prefix, bool dry_run, char 
                 if (c->pgscan == 0 && c->current_memory_usage == 0)
                         continue;
 
-                r = oomd_cgroup_kill(c->path, /* recurse= */ true, /* dry_run= */ dry_run, /* prekill_deadline= */ prekill_deadline);
+                r = oomd_cgroup_kill(c->path, /* recurse= */ true, /* dry_run= */ dry_run, /* prekill_deadline= */ prekill_deadline, e);
                 if (r == -ENOMEM)
                         return r; /* Treat oom as a hard error */
                 if (r < 0) {
@@ -428,7 +439,7 @@ int oomd_kill_by_pgscan_rate(Hashmap *h, const char *prefix, bool dry_run, char 
         return ret;
 }
 
-int oomd_kill_by_swap_usage(Hashmap *h, uint64_t threshold_usage, bool dry_run, char **ret_selected, usec_t prekill_deadline) {
+int oomd_kill_by_swap_usage(Hashmap *h, uint64_t threshold_usage, bool dry_run, char **ret_selected, usec_t prekill_deadline, sd_event *e) {
         _cleanup_free_ OomdCGroupContext **sorted = NULL;
         const OomdCGroupContext *killed = NULL;
         int n, r, ret = 0;
@@ -451,7 +462,7 @@ int oomd_kill_by_swap_usage(Hashmap *h, uint64_t threshold_usage, bool dry_run, 
                 if (c->swap_usage <= threshold_usage)
                         continue;
 
-                r = oomd_cgroup_kill(c->path, /* recurse= */ true, /* dry_run= */ dry_run, /* prekill_deadline= */ prekill_deadline);
+                r = oomd_cgroup_kill(c->path, /* recurse= */ true, /* dry_run= */ dry_run, /* prekill_deadline= */ prekill_deadline, e);
                 if (r == -ENOMEM)
                         return r; /* Treat oom as a hard error */
                 if (r < 0) {
